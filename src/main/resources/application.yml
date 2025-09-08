@@ -1,0 +1,57 @@
+spring:
+  application:
+    name: sql-dependency-extractor-backend
+  
+  datasource:
+    url: jdbc:postgresql://localhost:5432/lineage_extractor
+    username: postgres
+    password: yourpassword
+    driver-class-name: org.postgresql.Driver
+  
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
+
+server:
+  port: 8080
+  servlet:
+    context-path: /api
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    com.lineage: DEBUG
+    org.springframework.web: INFO
+    org.hibernate.SQL: DEBUG
+    org.hibernate.type.descriptor.sql.BasicBinder: TRACE
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} - %msg%n"
+
+# Application specific configuration
+app:
+  webhook:
+    base-url: http://localhost:8080/api/webhook
+  extraction:
+    default-timeout: 3600 # 1 hour in seconds
+    max-retries: 3
+  docker:
+    image-name: ${DOCKER_IMAGE_NAME:qupid-lineage}
+    backend-url: ${DOCKER_BACKEND_URL:http://host.docker.internal:8080/api}
+  groq:
+    api-key: ${GROQ_API_KEY:your-groq-api-key}
+  github:
+    token: ${GITHUB_TOKEN:your-github-token} 
