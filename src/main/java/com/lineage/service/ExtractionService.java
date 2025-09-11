@@ -47,6 +47,9 @@ public class ExtractionService {
     @Autowired
     private LineageProcessingService lineageProcessingService;
 
+    @Autowired
+    private ProcessedLineageService processedLineageService;
+
     private static final String EXTRACTOR_VERSION = "1.0.0";
 
     /**
@@ -312,13 +315,23 @@ public class ExtractionService {
             processingJobStatus.setPodId(event.getPodId());
             jobStatusRepository.save(processingJobStatus);
 
-            // Process lineage data - this replicates the process_lineage.json functionality
+            // Process basic lineage data
             try {
-                logger.info("Starting lineage processing for run: {}", extractionRun.getRunId());
+                logger.info("Starting basic lineage processing for run: {}", extractionRun.getRunId());
                 lineageProcessingService.processLineageForRun(extractionRun.getRunId());
-                logger.info("Completed lineage processing for run: {}", extractionRun.getRunId());
+                logger.info("Completed basic lineage processing for run: {}", extractionRun.getRunId());
             } catch (Exception e) {
-                logger.error("Failed to process lineage for run {}: {}", extractionRun.getRunId(), e.getMessage(), e);
+                logger.error("Failed to process basic lineage for run {}: {}", extractionRun.getRunId(), e.getMessage(), e);
+                // Don't fail the entire extraction, just log the error
+            }
+
+            // Process aggregated lineage data - this replicates the process_lineage.json functionality
+            try {
+                logger.info("Starting processed lineage generation for run: {}", extractionRun.getRunId());
+                processedLineageService.processLineageForRun(extractionRun.getRunId());
+                logger.info("Completed processed lineage generation for run: {}", extractionRun.getRunId());
+            } catch (Exception e) {
+                logger.error("Failed to generate processed lineage for run {}: {}", extractionRun.getRunId(), e.getMessage(), e);
                 // Don't fail the entire extraction, just log the error
             }
 

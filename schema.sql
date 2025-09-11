@@ -106,40 +106,49 @@ CREATE TABLE extraction_logs (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE aggregated_tables (
-    agg_table_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+-- Processed/Aggregated Tables for Visualization
+-- These tables store the consolidated, processed data equivalent to the JavaScript output
+
+CREATE TABLE processed_tables (
+    processed_table_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     run_id UUID NOT NULL REFERENCES extraction_runs(run_id) ON DELETE CASCADE,
-    table_name VARCHAR(255) NOT NULL,
-    table_schema VARCHAR(100),
-    total_references INTEGER NOT NULL DEFAULT 0,
-    source_files JSONB DEFAULT '[]',
-    target_files JSONB DEFAULT '[]',
-    columns_info JSONB DEFAULT '{}',
+    entity_id VARCHAR(255) NOT NULL, -- Short table name (key from JS output)
+    entity_name VARCHAR(255) NOT NULL, -- Same as entity_id
+    source VARCHAR(255), -- Derived source (e.g., "db.schema")
+    entity_type VARCHAR(50) NOT NULL DEFAULT 'table',
+    columns_count INTEGER NOT NULL DEFAULT 0,
+    tool_key VARCHAR(100),
+    partition_keys JSONB DEFAULT '[]', -- Array of partition key names
+    schema_metadata JSONB NOT NULL DEFAULT '{"fields": []}', -- Column definitions
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(run_id, entity_id) -- One record per table per run
+);
+
+CREATE TABLE processed_column_lineages (
+    column_lineage_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_id UUID NOT NULL REFERENCES extraction_runs(run_id) ON DELETE CASCADE,
+    processed_table_id UUID NOT NULL REFERENCES processed_tables(processed_table_id) ON DELETE CASCADE,
+    downstream_table VARCHAR(255) NOT NULL, -- Target table short name
+    downstream_column VARCHAR(255) NOT NULL, -- Target column name
+    upstream_table VARCHAR(255) NOT NULL, -- Source table short name  
+    upstream_column VARCHAR(255) NOT NULL, -- Source column name
+    transformation_type VARCHAR(100), -- Type of transformation
+    transformation_code TEXT, -- Extracted code snippet
+    file_id VARCHAR(500), -- Relative path to jinja file
+    transformation_lines JSONB DEFAULT '{}', -- Line numbers and context
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE fine_grained_lineage (
-    lineage_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+CREATE TABLE processed_table_lineages (
+    table_lineage_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     run_id UUID NOT NULL REFERENCES extraction_runs(run_id) ON DELETE CASCADE,
-    source_table VARCHAR(255) NOT NULL,
-    source_column VARCHAR(255) NOT NULL,
-    target_table VARCHAR(255) NOT NULL,
-    target_column VARCHAR(255) NOT NULL,
-    transformation_logic TEXT,
-    confidence_score DECIMAL(3,2) DEFAULT 1.0,
-    file_path VARCHAR(500),
-    line_number INTEGER,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE table_relationships (
-    relationship_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    run_id UUID NOT NULL REFERENCES extraction_runs(run_id) ON DELETE CASCADE,
-    parent_table VARCHAR(255) NOT NULL,
-    child_table VARCHAR(255) NOT NULL,
-    relationship_type VARCHAR(50) NOT NULL,
-    join_conditions JSONB DEFAULT '{}',
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    table_name VARCHAR(255) NOT NULL, -- The table this record describes
+    upstream_tables JSONB DEFAULT '[]', -- Array of upstream table relationships
+    downstream_tables JSONB DEFAULT '[]', -- Array of downstream table relationships
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(run_id, table_name) -- One record per table per run
 );
 
 -- Create indexes for better performance
@@ -171,16 +180,19 @@ CREATE INDEX idx_extraction_logs_run_id ON extraction_logs(run_id);
 CREATE INDEX idx_extraction_logs_level ON extraction_logs(log_level);
 CREATE INDEX idx_extraction_logs_created_at ON extraction_logs(created_at DESC);
 
-CREATE INDEX idx_aggregated_tables_run_id ON aggregated_tables(run_id);
-CREATE INDEX idx_aggregated_tables_table_name ON aggregated_tables(table_name);
+-- Indexes for processed tables
+CREATE INDEX idx_processed_tables_run_id ON processed_tables(run_id);
+CREATE INDEX idx_processed_tables_entity_id ON processed_tables(entity_id);
+CREATE INDEX idx_processed_tables_source ON processed_tables(source);
+CREATE INDEX idx_processed_tables_entity_type ON processed_tables(entity_type);
 
-CREATE INDEX idx_fine_grained_lineage_run_id ON fine_grained_lineage(run_id);
-CREATE INDEX idx_fine_grained_lineage_source ON fine_grained_lineage(source_table, source_column);
-CREATE INDEX idx_fine_grained_lineage_target ON fine_grained_lineage(target_table, target_column);
+CREATE INDEX idx_processed_column_lineages_run_id ON processed_column_lineages(run_id);
+CREATE INDEX idx_processed_column_lineages_processed_table_id ON processed_column_lineages(processed_table_id);
+CREATE INDEX idx_processed_column_lineages_downstream ON processed_column_lineages(downstream_table, downstream_column);
+CREATE INDEX idx_processed_column_lineages_upstream ON processed_column_lineages(upstream_table, upstream_column);
 
-CREATE INDEX idx_table_relationships_run_id ON table_relationships(run_id);
-CREATE INDEX idx_table_relationships_parent ON table_relationships(parent_table);
-CREATE INDEX idx_table_relationships_child ON table_relationships(child_table);
+CREATE INDEX idx_processed_table_lineages_run_id ON processed_table_lineages(run_id);
+CREATE INDEX idx_processed_table_lineages_table_name ON processed_table_lineages(table_name);
 
 -- Create trigger function to update updated_at timestamp
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -194,6 +206,14 @@ $$ LANGUAGE 'plpgsql';
 -- Create triggers
 CREATE TRIGGER update_extraction_runs_updated_at 
     BEFORE UPDATE ON extraction_runs 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_processed_tables_updated_at 
+    BEFORE UPDATE ON processed_tables 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_processed_table_lineages_updated_at 
+    BEFORE UPDATE ON processed_table_lineages 
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- Create views for common queries
@@ -260,8 +280,8 @@ SELECT 'job_status', COUNT(*) FROM job_status
 UNION ALL
 SELECT 'extraction_logs', COUNT(*) FROM extraction_logs
 UNION ALL
-SELECT 'aggregated_tables', COUNT(*) FROM aggregated_tables
+SELECT 'processed_tables', COUNT(*) FROM processed_tables
 UNION ALL
-SELECT 'fine_grained_lineage', COUNT(*) FROM fine_grained_lineage
+SELECT 'processed_column_lineages', COUNT(*) FROM processed_column_lineages
 UNION ALL
-SELECT 'table_relationships', COUNT(*) FROM table_relationships;
+SELECT 'processed_table_lineages', COUNT(*) FROM processed_table_lineages;

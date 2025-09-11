@@ -9,17 +9,18 @@ import org.hibernate.type.SqlTypes;
 
 import java.time.LocalDateTime;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 
 @Entity
-@Table(name = "aggregated_tables")
-public class AggregatedTable {
+@Table(name = "processed_tables", uniqueConstraints = {
+    @UniqueConstraint(columnNames = {"run_id", "entity_id"})
+})
+public class ProcessedTable {
 
     @Id
     @GeneratedValue(strategy = GenerationType.UUID)
-    @Column(name = "aggregated_table_id")
-    private UUID aggregatedTableId;
+    @Column(name = "processed_table_id")
+    private UUID processedTableId;
 
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "run_id", nullable = false)
@@ -57,26 +58,26 @@ public class AggregatedTable {
     private LocalDateTime createdAt;
 
     @UpdateTimestamp
-    @Column(name = "updated_at")
+    @Column(name = "updated_at", nullable = false)
     @JsonFormat(pattern = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS")
     private LocalDateTime updatedAt;
 
     // Constructors
-    public AggregatedTable() {}
+    public ProcessedTable() {}
 
-    public AggregatedTable(ExtractionRun extractionRun, String entityId, String entityName) {
+    public ProcessedTable(ExtractionRun extractionRun, String entityId, String entityName) {
         this.extractionRun = extractionRun;
         this.entityId = entityId;
         this.entityName = entityName;
     }
 
     // Getters and Setters
-    public UUID getAggregatedTableId() {
-        return aggregatedTableId;
+    public UUID getProcessedTableId() {
+        return processedTableId;
     }
 
-    public void setAggregatedTableId(UUID aggregatedTableId) {
-        this.aggregatedTableId = aggregatedTableId;
+    public void setProcessedTableId(UUID processedTableId) {
+        this.processedTableId = processedTableId;
     }
 
     public ExtractionRun getExtractionRun() {

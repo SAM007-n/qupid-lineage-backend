@@ -3,6 +3,7 @@ package com.lineage.entity;
 import com.fasterxml.jackson.annotation.JsonFormat;
 import jakarta.persistence.*;
 import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 
@@ -11,13 +12,15 @@ import java.util.List;
 import java.util.UUID;
 
 @Entity
-@Table(name = "table_relationships")
-public class TableRelationship {
+@Table(name = "processed_table_lineages", uniqueConstraints = {
+    @UniqueConstraint(columnNames = {"run_id", "table_name"})
+})
+public class ProcessedTableLineage {
 
     @Id
     @GeneratedValue(strategy = GenerationType.UUID)
-    @Column(name = "relationship_id")
-    private UUID relationshipId;
+    @Column(name = "table_lineage_id")
+    private UUID tableLineageId;
 
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "run_id", nullable = false)
@@ -39,21 +42,26 @@ public class TableRelationship {
     @JsonFormat(pattern = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS")
     private LocalDateTime createdAt;
 
-    // Constructors
-    public TableRelationship() {}
+    @UpdateTimestamp
+    @Column(name = "updated_at", nullable = false)
+    @JsonFormat(pattern = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS")
+    private LocalDateTime updatedAt;
 
-    public TableRelationship(ExtractionRun extractionRun, String tableName) {
+    // Constructors
+    public ProcessedTableLineage() {}
+
+    public ProcessedTableLineage(ExtractionRun extractionRun, String tableName) {
         this.extractionRun = extractionRun;
         this.tableName = tableName;
     }
 
     // Getters and Setters
-    public UUID getRelationshipId() {
-        return relationshipId;
+    public UUID getTableLineageId() {
+        return tableLineageId;
     }
 
-    public void setRelationshipId(UUID relationshipId) {
-        this.relationshipId = relationshipId;
+    public void setTableLineageId(UUID tableLineageId) {
+        this.tableLineageId = tableLineageId;
     }
 
     public ExtractionRun getExtractionRun() {
@@ -96,7 +104,15 @@ public class TableRelationship {
         this.createdAt = createdAt;
     }
 
-    // Inner class for table lineage information
+    public LocalDateTime getUpdatedAt() {
+        return updatedAt;
+    }
+
+    public void setUpdatedAt(LocalDateTime updatedAt) {
+        this.updatedAt = updatedAt;
+    }
+
+    // Inner classes for JSON structure
     public static class TableLineageInfo {
         private String table;
         private List<TransformationEntry> transformations;
