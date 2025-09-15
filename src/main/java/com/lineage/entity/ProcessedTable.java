@@ -1,6 +1,7 @@
 package com.lineage.entity;
 
 import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import jakarta.persistence.*;
 import org.hibernate.annotations.CreationTimestamp;
 import org.hibernate.annotations.UpdateTimestamp;
@@ -24,6 +25,7 @@ public class ProcessedTable {
 
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "run_id", nullable = false)
+    @JsonIgnoreProperties({"hibernateLazyInitializer", "handler"})
     private ExtractionRun extractionRun;
 
     @Column(name = "entity_id", nullable = false, length = 255)

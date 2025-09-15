@@ -8,6 +8,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
@@ -42,13 +43,21 @@ public class ExtractionService {
     private ObjectMapper objectMapper;
 
     @Autowired
-    private DockerService dockerService;
+    // Docker/orchestration settings (moved from DockerService)
+    @Value("${app.docker.image-name:sql-dependency-extractor}")
+    private String dockerImageName;
+
+    @Value("${app.docker.backend-url:http://host.docker.internal:8080/api}")
+    private String backendUrl;
 
     @Autowired
     private LineageProcessingService lineageProcessingService;
 
     @Autowired
-    private ProcessedLineageService processedLineageService;
+    private ExtractionLogRepository logRepository;
+
+    // Track running processes for control operations
+    private final java.util.concurrent.ConcurrentHashMap<UUID, Process> runningProcesses = new java.util.concurrent.ConcurrentHashMap<>();
 
     private static final String EXTRACTOR_VERSION = "1.0.0";
 
@@ -92,13 +101,13 @@ public class ExtractionService {
         final UUID runId = extractionRun.getRunId();
         
         // Launch the Docker container asynchronously
-        dockerService.launchExtractionContainer(
-            runId,
-            request.getRepositoryUrl(),
-            request.getBranch(),
-            request.getGitHubToken(),
-            groqApiKey,
-            request.getRunMode().toString()
+        launchExtractionContainer(
+                runId,
+                request.getRepositoryUrl(),
+                request.getBranch(),
+                request.getGitHubToken(),
+                groqApiKey,
+                request.getRunMode().toString()
         ).exceptionally(throwable -> {
             logger.error("Failed to launch Docker container for run {}: {}", 
                 runId, throwable.getMessage(), throwable);
@@ -108,6 +117,138 @@ public class ExtractionService {
         logger.info("Docker container launched for run ID: {}", extractionRun.getRunId());
 
         return extractionRun;
+    }
+
+    // =============================
+    // Orchestration (moved from DockerService)
+    // =============================
+
+    public java.util.concurrent.CompletableFuture<Void> launchExtractionContainer(
+            UUID runId,
+            String repositoryUrl,
+            String branch,
+            String githubToken,
+            String groqApiKey,
+            String runMode) {
+
+        return java.util.concurrent.CompletableFuture.runAsync(() -> {
+            try {
+                String containerName = "extraction-" + runId.toString().substring(0, 8);
+                String[] command = {
+                        "docker", "run", "--rm",
+                        "-e", "GROQ_API_KEY=" + groqApiKey,
+                        "-e", "GITHUB_TOKEN=" + githubToken,
+                        "-v", System.getProperty("user.dir") + "/lineage_output:/app/lineage_output",
+                        "--name", containerName,
+                        dockerImageName,
+                        "--repo-url", repositoryUrl,
+                        "--github-token", githubToken,
+                        "--branch", branch,
+                        "--backend-url", backendUrl,
+                        "--run-id", runId.toString(),
+                        "--run-mode", runMode
+                };
+
+                logger.info("Launching Docker container for run {}: {}", runId, String.join(" ", command));
+                ProcessBuilder processBuilder = new ProcessBuilder(command);
+                processBuilder.redirectErrorStream(true);
+                Process process = processBuilder.start();
+                runningProcesses.put(runId, process);
+                saveLog(runId, "Docker container started: " + containerName, "INFO");
+
+                try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(process.getInputStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        logger.info("Docker [{}]: {}", runId, line);
+                        saveLog(runId, line, "INFO");
+                    }
+                }
+
+                int exitCode = process.waitFor();
+                logger.info("Docker container for run {} exited with code: {}", runId, exitCode);
+                saveLog(runId, "Docker container exited with code: " + exitCode, exitCode == 0 ? "INFO" : "ERROR");
+                runningProcesses.remove(runId);
+            } catch (Exception e) {
+                logger.error("Error launching Docker container for run {}: {}", runId, e.getMessage(), e);
+                saveLog(runId, "Error launching Docker container: " + e.getMessage(), "ERROR");
+                runningProcesses.remove(runId);
+                Thread.currentThread().interrupt();
+            }
+        });
+    }
+
+    public boolean stopContainer(UUID runId) {
+        try {
+            Process process = runningProcesses.get(runId);
+            if (process != null && process.isAlive()) {
+                saveLog(runId, "Force killing Docker container process...", "INFO");
+                process.destroyForcibly();
+                runningProcesses.remove(runId);
+                saveLog(runId, "Docker container killed by admin", "INFO");
+                return true;
+            }
+            String containerName = "extraction-" + runId.toString().substring(0, 8);
+            String[] command = {"docker", "kill", containerName};
+            ProcessBuilder pb = new ProcessBuilder(command);
+            Process killProcess = pb.start();
+            int exitCode = killProcess.waitFor();
+            logger.info("Killed Docker container {} with exit code: {}", containerName, exitCode);
+            saveLog(runId, "Docker container killed via docker command", "INFO");
+            return exitCode == 0;
+        } catch (Exception e) {
+            logger.error("Error killing Docker container for run {}: {}", runId, e.getMessage(), e);
+            saveLog(runId, "Error killing Docker container: " + e.getMessage(), "ERROR");
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    public boolean pauseContainer(UUID runId) {
+        try {
+            String containerName = "extraction-" + runId.toString().substring(0, 8);
+            String[] command = {"docker", "pause", containerName};
+            Process process = new ProcessBuilder(command).start();
+            int exitCode = process.waitFor();
+            logger.info("Paused Docker container {} with exit code: {}", containerName, exitCode);
+            saveLog(runId, "Docker container paused by admin", "INFO");
+            return exitCode == 0;
+        } catch (Exception e) {
+            logger.error("Error pausing Docker container for run {}: {}", runId, e.getMessage(), e);
+            saveLog(runId, "Error pausing Docker container: " + e.getMessage(), "ERROR");
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    public boolean resumeContainer(UUID runId) {
+        try {
+            String containerName = "extraction-" + runId.toString().substring(0, 8);
+            String[] command = {"docker", "unpause", containerName};
+            Process process = new ProcessBuilder(command).start();
+            int exitCode = process.waitFor();
+            logger.info("Resumed Docker container {} with exit code: {}", containerName, exitCode);
+            saveLog(runId, "Docker container resumed by admin", "INFO");
+            return exitCode == 0;
+        } catch (Exception e) {
+            logger.error("Error resuming Docker container for run {}: {}", runId, e.getMessage(), e);
+            saveLog(runId, "Error resuming Docker container: " + e.getMessage(), "ERROR");
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    public boolean isContainerRunning(UUID runId) {
+        Process process = runningProcesses.get(runId);
+        return process != null && process.isAlive();
+    }
+
+    private void saveLog(UUID runId, String message, String logLevel) {
+        try {
+            ExtractionLog log = new ExtractionLog(runId, message, logLevel, "docker");
+            logRepository.save(log);
+        } catch (Exception e) {
+            logger.warn("Failed to save log for run {}: {}", runId, e.getMessage());
+        }
     }
 
     /**
@@ -315,25 +456,8 @@ public class ExtractionService {
             processingJobStatus.setPodId(event.getPodId());
             jobStatusRepository.save(processingJobStatus);
 
-            // Process basic lineage data
-            try {
-                logger.info("Starting basic lineage processing for run: {}", extractionRun.getRunId());
-                lineageProcessingService.processLineageForRun(extractionRun.getRunId());
-                logger.info("Completed basic lineage processing for run: {}", extractionRun.getRunId());
-            } catch (Exception e) {
-                logger.error("Failed to process basic lineage for run {}: {}", extractionRun.getRunId(), e.getMessage(), e);
-                // Don't fail the entire extraction, just log the error
-            }
-
-            // Process aggregated lineage data - this replicates the process_lineage.json functionality
-            try {
-                logger.info("Starting processed lineage generation for run: {}", extractionRun.getRunId());
-                processedLineageService.processLineageForRun(extractionRun.getRunId());
-                logger.info("Completed processed lineage generation for run: {}", extractionRun.getRunId());
-            } catch (Exception e) {
-                logger.error("Failed to generate processed lineage for run {}: {}", extractionRun.getRunId(), e.getMessage(), e);
-                // Don't fail the entire extraction, just log the error
-            }
+            // Note: Processed lineage generation is now handled by event listeners
+            // when raw data is inserted into tables and lineage_edges
 
             // Final job status update
             JobStatus jobStatus = new JobStatus(extractionRun);
@@ -467,17 +591,65 @@ public class ExtractionService {
                     data.get("tables"));
             }
             
-            // Process lineage edges from webhook data
+            // Process lineage edges from webhook data (supports multiple shapes)
+            List<Map<String, Object>> unifiedEdges = new ArrayList<>();
+
+            // 1) Flat array under key "lineageEdges"
             if (data.get("lineageEdges") instanceof List) {
                 @SuppressWarnings("unchecked")
                 List<Map<String, Object>> lineageEdges = (List<Map<String, Object>>) data.get("lineageEdges");
-                logger.info("Processing {} lineage edges for file: {}", lineageEdges.size(), file.getFilePath());
-                processLineageEdges(file, lineageEdges);
+                unifiedEdges.addAll(lineageEdges);
+            }
+
+            // 2) Separate arrays under keys "table_edges" / "column_edges" at root
+            if (data.get("table_edges") instanceof List) {
+                @SuppressWarnings("unchecked")
+                List<Map<String, Object>> tableEdges = (List<Map<String, Object>>) data.get("table_edges");
+                for (Map<String, Object> e : tableEdges) {
+                    Map<String, Object> m = new HashMap<>(e);
+                    m.putIfAbsent("edge_type", "TABLE_EDGE");
+                    unifiedEdges.add(m);
+                }
+            }
+            if (data.get("column_edges") instanceof List) {
+                @SuppressWarnings("unchecked")
+                List<Map<String, Object>> columnEdges = (List<Map<String, Object>>) data.get("column_edges");
+                for (Map<String, Object> e : columnEdges) {
+                    Map<String, Object> m = new HashMap<>(e);
+                    m.putIfAbsent("edge_type", "COLUMN_EDGE");
+                    unifiedEdges.add(m);
+                }
+            }
+
+            // 3) Nested under a "lineage" object
+            if (data.get("lineage") instanceof Map) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> lineage = (Map<String, Object>) data.get("lineage");
+                if (lineage.get("table_edges") instanceof List) {
+                    @SuppressWarnings("unchecked")
+                    List<Map<String, Object>> tableEdges = (List<Map<String, Object>>) lineage.get("table_edges");
+                    for (Map<String, Object> e : tableEdges) {
+                        Map<String, Object> m = new HashMap<>(e);
+                        m.putIfAbsent("edge_type", "TABLE_EDGE");
+                        unifiedEdges.add(m);
+                    }
+                }
+                if (lineage.get("column_edges") instanceof List) {
+                    @SuppressWarnings("unchecked")
+                    List<Map<String, Object>> columnEdges = (List<Map<String, Object>>) lineage.get("column_edges");
+                    for (Map<String, Object> e : columnEdges) {
+                        Map<String, Object> m = new HashMap<>(e);
+                        m.putIfAbsent("edge_type", "COLUMN_EDGE");
+                        unifiedEdges.add(m);
+                    }
+                }
+            }
+
+            if (!unifiedEdges.isEmpty()) {
+                logger.info("Processing {} lineage edges for file: {}", unifiedEdges.size(), file.getFilePath());
+                processLineageEdges(file, unifiedEdges);
             } else {
-                logger.warn("No lineageEdges data found or invalid format for file: {}", file.getFilePath());
-                logger.debug("LineageEdges data type: {}, value: {}", 
-                    data.get("lineageEdges") != null ? data.get("lineageEdges").getClass().getSimpleName() : "null", 
-                    data.get("lineageEdges"));
+                logger.warn("No lineage edges found in webhook payload for file: {}", file.getFilePath());
             }
 
             logger.info("File extraction processed: {} for run: {}", file.getFilePath(), event.getRunId());
@@ -593,8 +765,8 @@ public class ExtractionService {
                 TableEntity table = new TableEntity();
                 table.setFile(file);
                 
-                // Set table name (required field)
-                String tableName = (String) tableData.get("name");
+                // Set table name (required field) and sanitize jinja-like values
+                String tableName = sanitizeTableName((String) tableData.get("name"));
                 if (tableName == null || tableName.trim().isEmpty()) {
                     logger.warn("Skipping table with missing name for file: {}", file.getFilePath());
                     continue;
@@ -611,11 +783,9 @@ public class ExtractionService {
                     table.setTableRole(TableEntity.TableRole.INTERMEDIATE);
                 }
                 
-                // Set schema if provided
-                String schema = (String) tableData.get("schema");
-                if (schema != null && !schema.trim().isEmpty()) {
-                    table.setTableSchema(schema);
-                }
+                // Set schema with sanitization: replace jinja-like values with unknown_schema
+                String schema = sanitizeSchema((String) tableData.get("schema"), tableName);
+                table.setTableSchema(schema);
                 
                 // Set columns (required field) - columns come as List<String> from pod
                 Object columnsObj = tableData.get("columns");
@@ -645,6 +815,65 @@ public class ExtractionService {
         } catch (Exception e) {
             logger.error("Error processing tables for file {}: {}", file.getFilePath(), e.getMessage(), e);
         }
+    }
+
+    private String deriveSchemaFromTableName(String tableName) {
+        if (tableName == null || tableName.trim().isEmpty()) {
+            return "unknown_schema";
+        }
+        String name = tableName.trim();
+        String[] parts = name.split("\\.");
+        if (parts.length > 1) {
+            return String.join(".", java.util.Arrays.copyOf(parts, parts.length - 1));
+        }
+        return "unknown_schema";
+    }
+
+    private String sanitizeSchema(String providedSchema, String tableName) {
+        final String UNKNOWN = "unknown_schema";
+        try {
+            // If a schema is provided, validate it
+            if (providedSchema != null) {
+                String trimmed = providedSchema.trim();
+                if (!trimmed.isEmpty()) {
+                    // Consider any jinja/templating tokens as unknown
+                    if (trimmed.startsWith("{{") || trimmed.endsWith("}}") ||
+                        trimmed.contains("{{") || trimmed.contains("}}") ||
+                        trimmed.contains("%}") || trimmed.contains("{%") ||
+                        trimmed.contains("$") || trimmed.contains("params")) {
+                        return UNKNOWN;
+                    }
+                    return trimmed;
+                }
+            }
+
+            // Fallback: derive schema from table name
+            String derived = deriveSchemaFromTableName(tableName);
+            if (derived == null) {
+                return UNKNOWN;
+            }
+            String t = derived.trim();
+            if (t.isEmpty() || t.startsWith("{{") || t.endsWith("}}") || t.contains("{{") || t.contains("}}")) {
+                return UNKNOWN;
+            }
+            return t;
+        } catch (Exception e) {
+            return UNKNOWN;
+        }
+    }
+
+    private String sanitizeTableName(String rawName) {
+        if (rawName == null) {
+            return null;
+        }
+        String name = rawName.trim();
+        // If name contains jinja-like tokens, attempt to extract the final identifier
+        if (name.contains("{{") || name.contains("}}") || name.contains("%}") || name.contains("{%")) {
+            // Best-effort: drop templating and keep the last token after a dot if present
+            name = name.replaceAll("\\{\\{.*?\\}\\}", "").replaceAll("\\{%.*?%\\}", "");
+            name = name.replaceAll("\\s+", "");
+        }
+        return name;
     }
 
     /**

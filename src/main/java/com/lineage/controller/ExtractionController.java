@@ -6,7 +6,8 @@ import com.lineage.entity.ExtractionRun;
 import com.lineage.entity.ExtractionLog;
 import com.lineage.entity.JobStatus;
 import com.lineage.repository.ExtractionLogRepository;
-import com.lineage.service.DockerService;
+import com.lineage.service.ExtractionService;
+import com.lineage.service.LineageProcessingService;
 import com.lineage.service.ExtractionService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.PageRequest;
@@ -34,7 +35,10 @@ public class ExtractionController {
     private ExtractionService extractionService;
     
     @Autowired
-    private DockerService dockerService;
+    private ExtractionService dockerService;
+
+    @Autowired
+    private LineageProcessingService lineageProcessingService;
     
     @Autowired
     private ExtractionLogRepository logRepository;

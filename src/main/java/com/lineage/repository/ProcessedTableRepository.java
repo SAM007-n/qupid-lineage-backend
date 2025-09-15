@@ -35,4 +35,8 @@ public interface ProcessedTableRepository extends JpaRepository<ProcessedTable, 
 
     // Delete all processed tables for a run (for reprocessing)
     void deleteByExtractionRunRunId(UUID runId);
+
+    // Find processed table by entity ID (across all runs, get latest)
+    @Query("SELECT pt FROM ProcessedTable pt WHERE pt.entityId = :entityId ORDER BY pt.extractionRun.createdAt DESC")
+    Optional<ProcessedTable> findByEntityId(@Param("entityId") String entityId);
 }

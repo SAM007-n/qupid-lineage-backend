@@ -217,6 +217,16 @@ app:
     token: ${GITHUB_TOKEN}
 ```
 
+## ⚙️ Configuration
+
+Copy `env.template` to `.env` and edit values. The app reads environment variables (see placeholders in `src/main/resources/application.yml`).
+
+Important:
+- `SPRING_DATASOURCE_URL`, `SPRING_DATASOURCE_USERNAME`, `SPRING_DATASOURCE_PASSWORD`
+- `GROQ_API_KEY`, `GITHUB_TOKEN`
+- `DOCKER_IMAGE_NAME`, `DOCKER_BACKEND_URL`
+- `SERVER_PORT`, `WEBHOOK_BASE_URL`
+
 ## 🧪 **Testing**
 
 ### **Manual Testing**

@@ -12,6 +12,7 @@ import java.util.UUID;
 
 @Entity
 @Table(name = "tables")
+@EntityListeners(com.lineage.listener.TableEntityListener.class)
 public class TableEntity {
 
     @Id

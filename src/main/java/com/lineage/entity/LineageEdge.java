@@ -12,6 +12,7 @@ import java.util.UUID;
 
 @Entity
 @Table(name = "lineage_edges")
+@EntityListeners(com.lineage.listener.LineageEdgeListener.class)
 public class LineageEdge {
 
     @Id

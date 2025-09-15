@@ -9,6 +9,7 @@ import org.springframework.stereotype.Repository;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import com.lineage.entity.ExtractionRun;
 
 @Repository
 public interface ProcessedTableLineageRepository extends JpaRepository<ProcessedTableLineage, UUID> {
@@ -26,15 +27,18 @@ public interface ProcessedTableLineageRepository extends JpaRepository<Processed
     long countByRunId(@Param("runId") UUID runId);
 
     // Find tables that have upstream dependencies (are targets)
-    @Query("SELECT ptl FROM ProcessedTableLineage ptl WHERE ptl.extractionRun.runId = :runId " +
-           "AND JSON_LENGTH(ptl.upstreamTables) > 0 ORDER BY ptl.tableName")
+    @Query(value = "SELECT * FROM processed_table_lineages ptl WHERE ptl.run_id = :runId " +
+           "AND jsonb_array_length(ptl.upstream_tables) > 0 ORDER BY ptl.table_name", nativeQuery = true)
     List<ProcessedTableLineage> findTablesWithUpstreamDependencies(@Param("runId") UUID runId);
 
     // Find tables that have downstream dependencies (are sources)
-    @Query("SELECT ptl FROM ProcessedTableLineage ptl WHERE ptl.extractionRun.runId = :runId " +
-           "AND JSON_LENGTH(ptl.downstreamTables) > 0 ORDER BY ptl.tableName")
+    @Query(value = "SELECT * FROM processed_table_lineages ptl WHERE ptl.run_id = :runId " +
+           "AND jsonb_array_length(ptl.downstream_tables) > 0 ORDER BY ptl.table_name", nativeQuery = true)
     List<ProcessedTableLineage> findTablesWithDownstreamDependencies(@Param("runId") UUID runId);
 
     // Delete all table lineages for a run (for reprocessing)
     void deleteByExtractionRunRunId(UUID runId);
+
+    // Find table lineage by extraction run and table name (for service)
+    Optional<ProcessedTableLineage> findByExtractionRunAndTableName(ExtractionRun extractionRun, String tableName);
 }
