@@ -1,14 +1,11 @@
 package com.lineage.service;
 
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.lineage.dto.*;
-import com.lineage.entity.ProcessedTable;
-import com.lineage.entity.ProcessedTableLineage;
-import com.lineage.entity.ProcessedColumnLineage;
-import com.lineage.repository.ProcessedTableRepository;
-import com.lineage.repository.ProcessedTableLineageRepository;
-import com.lineage.repository.ProcessedColumnLineageRepository;
+import com.lineage.entity.Asset;
+import com.lineage.entity.Lineage;
+import com.lineage.repository.AssetRepository;
+import com.lineage.repository.AssetColumnRepository;
+import com.lineage.repository.LineageRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -18,95 +15,235 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * LineageApiService adapts processed data from the database into the
- * frontend-facing DTO contract (LineageResponseDto, EntityDto, etc.).
- *
- * This service performs format conversion only, without mutating state.
+ * LineageApiService provides search functionality using the normalized asset schema.
+ * Legacy lineage endpoints are temporarily disabled while migrating to the new schema.
  */
 @Service
 public class LineageApiService {
 
     private static final Logger logger = LoggerFactory.getLogger(LineageApiService.class);
-    private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Autowired
-    private ProcessedTableRepository processedTableRepository;
+    private AssetRepository assetRepository;
 
     @Autowired
-    private ProcessedTableLineageRepository processedTableLineageRepository;
+    private LineageRepository lineageRepository;
 
     @Autowired
-    private ProcessedColumnLineageRepository processedColumnLineageRepository;
+    private AssetColumnRepository assetColumnRepository;
 
-    /**
-     * Get lineage (upstream/downstream) for a specific entity
-     */
-    public LineageResponseDto getLineage(String entityId, LineageDirection direction) {
-        logger.info("Getting {} lineage for entity: {}", direction, entityId);
-
-        // Find the main entity
-        ProcessedTable mainEntity = processedTableRepository.findByEntityId(entityId)
-            .orElseThrow(() -> new RuntimeException("Entity not found: " + entityId));
-
-        // Get table lineage
-        ProcessedTableLineage tableLineage = processedTableLineageRepository
-            .findByExtractionRunAndTableName(mainEntity.getExtractionRun(), entityId)
-            .orElse(null);
-
-        List<LineageNodeDto> lineageNodes = new ArrayList<>();
-        
-        if (tableLineage != null) {
-            List<ProcessedTableLineage.TableLineageInfo> relatedTables = direction == LineageDirection.upstream 
-                ? tableLineage.getUpstreamTables() 
-                : tableLineage.getDownstreamTables();
-
-            if (relatedTables != null) {
-                lineageNodes = relatedTables.stream()
-                    .map(this::convertToLineageNode)
-                    .collect(Collectors.toList());
+    public EdgeDetailsDto getEdgeDetails(String edgeId) {
+        try {
+            java.util.UUID id = java.util.UUID.fromString(edgeId);
+            var opt = lineageRepository.findById(id);
+            if (opt.isEmpty()) throw new RuntimeException("Edge not found: " + edgeId);
+            var e = opt.get();
+            EdgeDetailsDto dto = new EdgeDetailsDto();
+            dto.setEdgeId(edgeId);
+            dto.setEdgeType(e.getEdgeType());
+            dto.setFromEntity(e.getFromAsset() != null ? e.getFromAsset().getShortName() : null);
+            dto.setToEntity(e.getToAsset() != null ? e.getToAsset().getShortName() : null);
+            dto.setFromColumn(e.getFromColumn());
+            dto.setToColumn(e.getToColumn());
+            dto.setTransformationType(e.getTransformationType());
+            dto.setFileId(e.getFile() != null ? e.getFile().getFilePath() : null);
+            if (e.getStartLine() != null || e.getEndLine() != null) {
+                dto.setLines(new TransformationLinesDto(e.getStartLine(), e.getEndLine()));
             }
+            return dto;
+        } catch (IllegalArgumentException ex) {
+            throw new RuntimeException("Invalid edgeId: " + edgeId);
         }
-
-        // Get fine-grained lineages for this entity
-        List<FineGrainedLineageDto> fineGrainedLineages = getFineGrainedLineagesForEntity(
-            mainEntity.getExtractionRun().getRunId(), entityId);
-
-        // Get schema metadata
-        SchemaMetadataDto schemaMetadata = convertSchemaMetadata(mainEntity);
-
-        return new LineageResponseDto(
-            mainEntity.getEntityId(),
-            mainEntity.getEntityName(),
-            mainEntity.getEntityType(),
-            direction,
-            lineageNodes
-        ) {{
-            setFineGrainedLineages(fineGrainedLineages);
-            setSchemaMetadata(schemaMetadata);
-        }};
     }
 
     /**
-     * Get entity details
+     * Get lineage (upstream/downstream) for a specific entity
+     * Uses table name-based queries to find all relationships across extraction runs
+     */
+    public LineageResponseDto getLineage(String entityId, LineageDirection direction) {
+        logger.info("Getting {} lineage for entity: {}", direction, entityId);
+        Asset center = assetRepository.findTopByShortNameIgnoreCaseOrderByCreatedAtDesc(entityId);
+        if (center == null) throw new RuntimeException("Entity not found: " + entityId);
+
+        // Fetch edges for direction by table name across all runs to ensure complete lineage
+        List<Lineage> edges = (direction == LineageDirection.upstream)
+                ? lineageRepository.findByToAssetShortNameIgnoreCase(entityId)
+                : lineageRepository.findByFromAssetShortNameIgnoreCase(entityId);
+
+        Map<String, List<Lineage>> grouped = new LinkedHashMap<>();
+        for (Lineage e : edges) {
+            String neighborShort = (direction == LineageDirection.upstream)
+                    ? e.getFromAsset().getShortName()
+                    : e.getToAsset().getShortName();
+            grouped.computeIfAbsent(neighborShort, k -> new ArrayList<>()).add(e);
+        }
+
+        List<LineageNodeDto> nodes = new ArrayList<>();
+        for (Map.Entry<String, List<Lineage>> entry : grouped.entrySet()) {
+            String shortName = entry.getKey();
+            List<Lineage> groupEdges = entry.getValue();
+            // Use the first edge to get full name
+            String fullName = (direction == LineageDirection.upstream)
+                    ? groupEdges.get(0).getFromAsset().getFullName()
+                    : groupEdges.get(0).getToAsset().getFullName();
+
+            LineageNodeDto node = new LineageNodeDto(shortName, fullName, "table");
+
+            // Aggregate transformations per neighbor, dedup by file + line range + type
+            List<TransformationDto> transformations = new ArrayList<>();
+            Set<String> seen = new HashSet<>();
+            for (Lineage e : groupEdges) {
+                String fileId = e.getFile() != null ? e.getFile().getFilePath() : null;
+                Integer s = e.getStartLine();
+                Integer en = e.getEndLine();
+                String t = e.getTransformationType();
+                String key = (fileId == null ? "" : fileId) + "|" + (s == null ? "" : s) + "|" + (en == null ? "" : en) + "|" + (t == null ? "" : t);
+                if (seen.contains(key)) continue;
+                seen.add(key);
+                TransformationLinesDto lines = (s != null || en != null) ? new TransformationLinesDto(s, en) : null;
+                transformations.add(new TransformationDto(fileId, t, lines));
+            }
+            node.setTransformations(transformations.isEmpty() ? null : transformations);
+            nodes.add(node);
+        }
+
+        // Build fine-grained (column) lineage
+        List<FineGrainedLineageDto> fine = new ArrayList<>();
+        Set<String> fgSeen = new HashSet<>();
+        for (Lineage e : edges) {
+            if (e.getEdgeType() == null || !"column_edge".equalsIgnoreCase(e.getEdgeType())) continue;
+            String fromCol = e.getFromColumn();
+            String toCol = e.getToColumn();
+            if ((fromCol == null || fromCol.isBlank()) && (toCol == null || toCol.isBlank())) continue;
+
+            List<FieldRefDto> upstreams = new ArrayList<>();
+            List<FieldRefDto> downstreams = new ArrayList<>();
+
+            String fileId = e.getFile() != null ? e.getFile().getFilePath() : null;
+            Integer s = e.getStartLine();
+            Integer en = e.getEndLine();
+            TransformationLinesDto linesDto = (s != null || en != null) ? new TransformationLinesDto(s, en) : null;
+            TransformationDto tDto = new TransformationDto(fileId, e.getTransformationType(), linesDto);
+
+            if (direction == LineageDirection.upstream) {
+                // center is target; show upstream columns feeding center
+                FieldRefDto up = new FieldRefDto(e.getFromAsset().getShortName(), fromCol);
+                up.setTransformation(tDto);
+                upstreams.add(up);
+                downstreams.add(new FieldRefDto(center.getShortName(), toCol));
+            } else {
+                // center is source; show downstream columns produced from center
+                FieldRefDto up = new FieldRefDto(center.getShortName(), fromCol);
+                up.setTransformation(tDto);
+                upstreams.add(up);
+                downstreams.add(new FieldRefDto(e.getToAsset().getShortName(), toCol));
+            }
+
+            String key = (upstreams.isEmpty()?"":upstreams.get(0).getUrn()+"|"+upstreams.get(0).getPath())+
+                    "->"+
+                    (downstreams.isEmpty()?"":downstreams.get(0).getUrn()+"|"+downstreams.get(0).getPath());
+            if (fgSeen.add(key)) {
+                fine.add(new FineGrainedLineageDto(upstreams, downstreams));
+            }
+        }
+
+        LineageResponseDto resp = new LineageResponseDto(center.getShortName(), center.getFullName(), "table", direction, nodes);
+        if (!fine.isEmpty()) resp.setFineGrainedLineages(fine);
+        return resp;
+    }
+
+    /**
+     * Get entity details from normalized schema
      */
     public EntityDto getEntity(String entityId) {
         logger.info("Getting entity details for: {}", entityId);
+        Asset asset = assetRepository.findTopByShortNameIgnoreCaseOrderByCreatedAtDesc(entityId);
+        if (asset == null) throw new RuntimeException("Entity not found: " + entityId);
 
-        ProcessedTable entity = processedTableRepository.findByEntityId(entityId)
-            .orElseThrow(() -> new RuntimeException("Entity not found: " + entityId));
+        int upstream = lineageRepository.findByToAssetAssetId(asset.getAssetId()).size();
+        int downstream = lineageRepository.findByFromAssetAssetId(asset.getAssetId()).size();
 
-        return convertToEntityDto(entity);
+        int colCount = 0;
+        List<SchemaFieldDto> fields = new ArrayList<>();
+        try {
+            // Only retrieve TARGET columns for display, but keep SOURCE columns in database
+            var cols = assetColumnRepository.findByAssetAssetIdAndRole(asset.getAssetId(), Asset.Role.TARGET);
+            colCount = cols.size();
+            for (var c : cols) fields.add(new SchemaFieldDto(c.getColumnName(), "varchar"));
+        } catch (Exception ignore) {}
+
+        // Build fine-grained (column) lineage for this entity (both directions)
+        List<FineGrainedLineageDto> fine = new ArrayList<>();
+        Set<String> fgSeen = new HashSet<>();
+        List<Lineage> allEdges = new ArrayList<>();
+        try {
+            allEdges.addAll(lineageRepository.findByToAssetAssetId(asset.getAssetId()));
+            allEdges.addAll(lineageRepository.findByFromAssetAssetId(asset.getAssetId()));
+        } catch (Exception ignore) {}
+
+        for (Lineage e : allEdges) {
+            if (e.getEdgeType() == null || !"column_edge".equalsIgnoreCase(e.getEdgeType())) continue;
+            String fromCol = e.getFromColumn();
+            String toCol = e.getToColumn();
+            if ((fromCol == null || fromCol.isBlank()) && (toCol == null || toCol.isBlank())) continue;
+
+            List<FieldRefDto> upstreams = new ArrayList<>();
+            List<FieldRefDto> downstreams = new ArrayList<>();
+
+            String fileId = e.getFile() != null ? e.getFile().getFilePath() : null;
+            Integer s = e.getStartLine();
+            Integer en = e.getEndLine();
+            TransformationLinesDto linesDto = (s != null || en != null) ? new TransformationLinesDto(s, en) : null;
+            TransformationDto tDto = new TransformationDto(fileId, e.getTransformationType(), linesDto);
+
+            if (e.getToAsset() != null && e.getToAsset().getAssetId().equals(asset.getAssetId())) {
+                // upstream into this asset
+                FieldRefDto up = new FieldRefDto(e.getFromAsset().getShortName(), fromCol);
+                up.setTransformation(tDto);
+                upstreams.add(up);
+                downstreams.add(new FieldRefDto(asset.getShortName(), toCol));
+            } else {
+                // downstream from this asset
+                FieldRefDto up = new FieldRefDto(asset.getShortName(), fromCol);
+                up.setTransformation(tDto);
+                upstreams.add(up);
+                downstreams.add(new FieldRefDto(e.getToAsset().getShortName(), toCol));
+            }
+
+            String key = (upstreams.isEmpty()?"":upstreams.get(0).getUrn()+"|"+upstreams.get(0).getPath())+
+                    "->"+
+                    (downstreams.isEmpty()?"":downstreams.get(0).getUrn()+"|"+downstreams.get(0).getPath());
+            if (fgSeen.add(key)) {
+                fine.add(new FineGrainedLineageDto(upstreams, downstreams));
+            }
+        }
+
+        EntityDto dto = new EntityDto();
+        dto.setEntityId(asset.getShortName());
+        dto.setEntityName(asset.getFullName());
+        dto.setEntityType("table");
+        dto.setColumnCount(colCount);
+        dto.setSource(asset.getSchemaName());
+        dto.setUpstreamCount(upstream);
+        dto.setDownstreamCount(downstream);
+        dto.setHasUpstream(upstream > 0);
+        dto.setHasDownstream(downstream > 0);
+        dto.setSchemaMetadata(new SchemaMetadataDto(fields));
+        if (!fine.isEmpty()) dto.setFineGrainedLineages(fine);
+        return dto;
     }
 
     /**
      * Get multiple entity details
      */
     public List<EntityDto> getBulkEntities(List<String> entityIds) {
-        logger.info("Getting bulk entity details for {} entities", entityIds.size());
-
-        return entityIds.stream()
-            .map(this::getEntity)
-            .collect(Collectors.toList());
+        logger.info("Getting bulk entity details for {} entities", entityIds == null ? 0 : entityIds.size());
+        if (entityIds == null || entityIds.isEmpty()) return List.of();
+        List<EntityDto> out = new ArrayList<>();
+        for (String id : entityIds) {
+            try { out.add(getEntity(id)); } catch (Exception ignore) {}
+        }
+        return out;
     }
 
     /**
@@ -117,182 +254,17 @@ public class LineageApiService {
         if (q.isEmpty()) {
             return Collections.emptyList();
         }
-
-        List<ProcessedTable> all = processedTableRepository.findAll();
-
-        return all.stream()
-            .filter(t -> {
-                String id = Optional.ofNullable(t.getEntityId()).orElse("").toLowerCase();
-                String name = Optional.ofNullable(t.getEntityName()).orElse("").toLowerCase();
+        // Use new normalized schema
+        return assetRepository.findAll().stream()
+            .filter(a -> {
+                String id = Optional.ofNullable(a.getShortName()).orElse("").toLowerCase();
+                String name = Optional.ofNullable(a.getFullName()).orElse("").toLowerCase();
                 return id.contains(q) || name.contains(q);
             })
             .limit(50)
-            .map(t -> new SearchResultItem(t.getEntityId(), t.getEntityName(), t.getEntityType(), t.getColumnsCount()))
+            .map(a -> new SearchResultItem(a.getShortName(), a.getFullName(), "table", null))
             .collect(Collectors.toList());
     }
 
-    /**
-     * Convert ProcessedTable to EntityDto
-     */
-    private EntityDto convertToEntityDto(ProcessedTable entity) {
-        EntityDto dto = new EntityDto();
-        dto.setEntityId(entity.getEntityId());
-        dto.setEntityName(entity.getEntityName());
-        dto.setEntityType(entity.getEntityType());
-        dto.setColumnCount(entity.getColumnsCount());
-        dto.setSource(entity.getSource());
-        dto.setToolKey(entity.getToolKey());
-
-        // Calculate upstream/downstream counts
-        ProcessedTableLineage tableLineage = processedTableLineageRepository
-            .findByExtractionRunAndTableName(entity.getExtractionRun(), entity.getEntityId())
-            .orElse(null);
-
-        int upstreamCount = 0;
-        int downstreamCount = 0;
-        
-        if (tableLineage != null) {
-            upstreamCount = tableLineage.getUpstreamTables() != null ? tableLineage.getUpstreamTables().size() : 0;
-            downstreamCount = tableLineage.getDownstreamTables() != null ? tableLineage.getDownstreamTables().size() : 0;
-        }
-
-        dto.setUpstreamCount(upstreamCount);
-        dto.setDownstreamCount(downstreamCount);
-        dto.setHasUpstream(upstreamCount > 0);
-        dto.setHasDownstream(downstreamCount > 0);
-
-        // Get fine-grained lineages
-        List<FineGrainedLineageDto> fineGrainedLineages = getFineGrainedLineagesForEntity(
-            entity.getExtractionRun().getRunId(), entity.getEntityId());
-        dto.setFineGrainedLineages(fineGrainedLineages);
-
-        // Convert schema metadata
-        dto.setSchemaMetadata(convertSchemaMetadata(entity));
-
-        return dto;
-    }
-
-    /**
-     * Convert TableLineageInfo to LineageNodeDto
-     */
-    private LineageNodeDto convertToLineageNode(ProcessedTableLineage.TableLineageInfo tableInfo) {
-        String tableId = tableInfo.getTable();
-        String tableName = tableId; // Use table ID as name for now
-        
-        LineageNodeDto node = new LineageNodeDto(tableId, tableName, "table");
-        
-        // Convert transformations if present
-        List<ProcessedTableLineage.TransformationEntry> transformationEntries = tableInfo.getTransformations();
-        
-        if (transformationEntries != null) {
-            List<TransformationDto> transformations = transformationEntries.stream()
-                .map(this::convertToTransformationDto)
-                .collect(Collectors.toList());
-            node.setTransformations(transformations);
-        }
-        
-        return node;
-    }
-
-    /**
-     * Convert TransformationEntry to TransformationDto
-     */
-    private TransformationDto convertToTransformationDto(ProcessedTableLineage.TransformationEntry transformationEntry) {
-        String fileId = transformationEntry.getFileId();
-        String transformationType = transformationEntry.getTransformationType();
-        
-        ProcessedTableLineage.LineRange lineRange = transformationEntry.getLines();
-        
-        TransformationLinesDto lines = null;
-        if (lineRange != null) {
-            lines = new TransformationLinesDto(lineRange.getStartLine(), lineRange.getEndLine());
-        }
-        
-        return new TransformationDto(fileId, transformationType, lines);
-    }
-
-    /**
-     * Get fine-grained lineages for an entity
-     */
-    private List<FineGrainedLineageDto> getFineGrainedLineagesForEntity(UUID runId, String entityId) {
-        List<ProcessedColumnLineage> columnLineages = processedColumnLineageRepository
-            .findByRunIdAndDownstreamTable(runId, entityId);
-
-        // Group by downstream column to create FineGrainedLineageDto objects
-        Map<String, List<ProcessedColumnLineage>> groupedByDownstream = columnLineages.stream()
-            .collect(Collectors.groupingBy(ProcessedColumnLineage::getDownstreamColumn));
-
-        return groupedByDownstream.entrySet().stream()
-            .map(entry -> {
-                String downstreamColumn = entry.getKey();
-                List<ProcessedColumnLineage> lineagesForColumn = entry.getValue();
-
-                List<FieldRefDto> upstreams = lineagesForColumn.stream()
-                    .map(cl -> {
-                        FieldRefDto upstream = new FieldRefDto(cl.getUpstreamTable(), cl.getUpstreamColumn());
-                        
-                        // Add transformation if available
-                        if (cl.getTransformationType() != null && cl.getTransformationLines() != null) {
-                            ProcessedColumnLineage.TransformationLines transformationLines = cl.getTransformationLines();
-                            Integer startLine = transformationLines.getStartLine();
-                            Integer endLine = transformationLines.getEndLine();
-                            
-                            if (startLine != null && endLine != null) {
-                                TransformationLinesDto lines = new TransformationLinesDto(startLine, endLine);
-                                TransformationDto transformation = new TransformationDto(
-                                    cl.getFileId(), 
-                                    cl.getTransformationType(), 
-                                    lines
-                                );
-                                upstream.setTransformation(transformation);
-                            }
-                        }
-                        
-                        return upstream;
-                    })
-                    .collect(Collectors.toList());
-
-                List<FieldRefDto> downstreams = Collections.singletonList(
-                    new FieldRefDto(entityId, downstreamColumn)
-                );
-
-                return new FineGrainedLineageDto(upstreams, downstreams);
-            })
-            .collect(Collectors.toList());
-    }
-
-    /**
-     * Convert schema metadata from ProcessedTable to DTO
-     */
-    private SchemaMetadataDto convertSchemaMetadata(ProcessedTable entity) {
-        ProcessedTable.SchemaMetadata schemaMetadata = entity.getSchemaMetadata();
-        if (schemaMetadata == null) {
-            return new SchemaMetadataDto();
-        }
-
-        try {
-            List<ProcessedTable.FieldMetadata> fields = schemaMetadata.getFields();
-            
-            if (fields == null) {
-                return new SchemaMetadataDto();
-            }
-
-            List<SchemaFieldDto> fieldDtos = fields.stream()
-                .map(field -> {
-                    SchemaFieldDto fieldDto = new SchemaFieldDto();
-                    fieldDto.setPath(field.getPath());
-                    fieldDto.setNativeDataType(field.getNativeDataType());
-                    fieldDto.setLabel(field.getLabel());
-                    fieldDto.setDescription(field.getDescription());
-                    fieldDto.setNullable(field.getNullable());
-                    return fieldDto;
-                })
-                .collect(Collectors.toList());
-
-            return new SchemaMetadataDto(fieldDtos);
-        } catch (Exception e) {
-            logger.warn("Failed to convert schema metadata: {}", e.getMessage());
-            return new SchemaMetadataDto();
-        }
-    }
+    // Helper methods removed - will be reimplemented using normalized schema when needed
 }

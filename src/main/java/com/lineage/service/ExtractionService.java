@@ -30,11 +30,19 @@ public class ExtractionService {
     @Autowired
     private FileRepository fileRepository;
 
-    @Autowired
-    private TableRepository tableRepository;
+    // Legacy repositories removed - using normalized schema only
 
     @Autowired
-    private LineageEdgeRepository lineageEdgeRepository;
+    private AssetRepository assetRepository;
+
+    @Autowired
+    private AssetColumnRepository assetColumnRepository;
+
+    @Autowired
+    private AssetFileRepository assetFileRepository;
+
+    @Autowired
+    private LineageRepository lineageRepository;
 
     @Autowired
     private JobStatusRepository jobStatusRepository;
@@ -50,9 +58,7 @@ public class ExtractionService {
     @Value("${app.docker.backend-url:http://host.docker.internal:8080/api}")
     private String backendUrl;
 
-    @Autowired
-    private LineageProcessingService lineageProcessingService;
-
+    // Removed legacy processing service
     @Autowired
     private ExtractionLogRepository logRepository;
 
@@ -136,6 +142,9 @@ public class ExtractionService {
                 String containerName = "extraction-" + runId.toString().substring(0, 8);
                 String[] command = {
                         "docker", "run", "--rm",
+                        // Increase container resources
+                        "--cpus", "4",
+                        "--memory", "8g",
                         "-e", "GROQ_API_KEY=" + groqApiKey,
                         "-e", "GITHUB_TOKEN=" + githubToken,
                         "-v", System.getProperty("user.dir") + "/lineage_output:/app/lineage_output",
@@ -268,10 +277,10 @@ public class ExtractionService {
         long succeededFiles = fileRepository.countByRunIdAndStatus(runId, File.FileStatus.SUCCESS);
         long failedFiles = fileRepository.countByRunIdAndStatus(runId, File.FileStatus.FAILED);
 
-        // Get lineage statistics
-        long totalEdges = lineageEdgeRepository.countByRunId(runId);
-        long tableEdges = lineageEdgeRepository.countByEdgeTypeAndRunId(LineageEdge.EdgeType.TABLE_EDGE, runId);
-        long columnEdges = lineageEdgeRepository.countByEdgeTypeAndRunId(LineageEdge.EdgeType.COLUMN_EDGE, runId);
+        // Lineage statistics from normalized schema
+        long totalEdges = lineageRepository.findByExtractionRunRunId(runId).size();
+        long tableEdges = lineageRepository.findByExtractionRunRunId(runId).stream().filter(l -> "table_edge".equalsIgnoreCase(l.getEdgeType())).count();
+        long columnEdges = lineageRepository.findByExtractionRunRunId(runId).stream().filter(l -> "column_edge".equalsIgnoreCase(l.getEdgeType())).count();
 
         Map<String, Object> status = new HashMap<>();
         status.put("runId", extractionRun.getRunId());
@@ -573,22 +582,13 @@ public class ExtractionService {
             
             fileRepository.save(file);
 
-            // Process tables from webhook data
+            // Process tables from webhook data into normalized schema
             logger.info("🔍 WEBHOOK DATA KEYS: {}", data.keySet());
-            logger.info("🔍 TABLES DATA: type={}, value={}", 
-                data.get("tables") != null ? data.get("tables").getClass().getSimpleName() : "null", 
-                data.get("tables"));
-                
             if (data.get("tables") instanceof List) {
                 @SuppressWarnings("unchecked")
                 List<Map<String, Object>> tables = (List<Map<String, Object>>) data.get("tables");
                 logger.info("✅ Processing {} tables for file: {}", tables.size(), file.getFilePath());
                 processTables(file, tables);
-            } else {
-                logger.warn("❌ No tables data found or invalid format for file: {}", file.getFilePath());
-                logger.warn("❌ Tables data type: {}, value: {}", 
-                    data.get("tables") != null ? data.get("tables").getClass().getSimpleName() : "null", 
-                    data.get("tables"));
             }
             
             // Process lineage edges from webhook data (supports multiple shapes)
@@ -648,8 +648,6 @@ public class ExtractionService {
             if (!unifiedEdges.isEmpty()) {
                 logger.info("Processing {} lineage edges for file: {}", unifiedEdges.size(), file.getFilePath());
                 processLineageEdges(file, unifiedEdges);
-            } else {
-                logger.warn("No lineage edges found in webhook payload for file: {}", file.getFilePath());
             }
 
             logger.info("File extraction processed: {} for run: {}", file.getFilePath(), event.getRunId());
@@ -762,58 +760,111 @@ public class ExtractionService {
             logger.info("🚀 STARTING TO PROCESS {} TABLES for file: {}", tables.size(), file.getFilePath());
             for (Map<String, Object> tableData : tables) {
                 logger.info("🔍 Processing table data: {}", tableData);
-                TableEntity table = new TableEntity();
-                table.setFile(file);
-                
-                // Set table name (required field) and sanitize jinja-like values
-                String tableName = sanitizeTableName((String) tableData.get("name"));
+                // Extract table data
+                String tableName = (String) tableData.get("name");
                 if (tableName == null || tableName.trim().isEmpty()) {
                     logger.warn("Skipping table with missing name for file: {}", file.getFilePath());
                     continue;
                 }
-                table.setTableName(tableName);
                 
-                // Set table role
+                // Determine role
                 String roleStr = (String) tableData.get("role");
+                Asset.Role assetRole = Asset.Role.INTERMEDIATE;
                 if ("SOURCE".equalsIgnoreCase(roleStr)) {
-                    table.setTableRole(TableEntity.TableRole.SOURCE);
+                    assetRole = Asset.Role.SOURCE;
                 } else if ("TARGET".equalsIgnoreCase(roleStr)) {
-                    table.setTableRole(TableEntity.TableRole.TARGET);
-                } else {
-                    table.setTableRole(TableEntity.TableRole.INTERMEDIATE);
+                    assetRole = Asset.Role.TARGET;
                 }
                 
-                // Set schema with sanitization: replace jinja-like values with unknown_schema
-                String schema = sanitizeSchema((String) tableData.get("schema"), tableName);
-                table.setTableSchema(schema);
+                // Set schema: prefer provided schema, else derive from table name
+                String schema = (String) tableData.get("schema");
+                if (schema == null || schema.trim().isEmpty()) {
+                    schema = deriveSchemaFromTableName(tableName);
+                }
                 
-                // Set columns (required field) - columns come as List<String> from pod
                 Object columnsObj = tableData.get("columns");
-                Map<String, Object> columns;
-                if (columnsObj instanceof List) {
-                    @SuppressWarnings("unchecked")
-                    List<String> columnsList = (List<String>) columnsObj;
-                    // Convert List<String> to Map<String, Object> format
-                    columns = new HashMap<>();
-                    for (int i = 0; i < columnsList.size(); i++) {
-                        columns.put("column_" + i, columnsList.get(i));
-                    }
-                    logger.info("📝 Converted {} columns from list to map for table: {}", columnsList.size(), tableName);
-                } else if (columnsObj instanceof Map) {
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> mapColumns = (Map<String, Object>) columnsObj;
-                    columns = mapColumns;
+                logger.info("✅ Processing table: {} (role: {}, schema: {}) for file: {}", tableName, assetRole, schema, file.getFilePath());
+
+                String fullName = (schema != null && !schema.isBlank()) ? (schema + "." + tableName) : tableName;
+                String shortName = tableName;
+                // Only persist SOURCE/TARGET assets; skip intermediates
+                if (assetRole != Asset.Role.INTERMEDIATE) {
+                    Asset asset = upsertAsset(file.getExtractionRun().getRunId(), fullName, shortName, schema, assetRole, file.getExtractionRun());
+                    linkAssetToFile(asset, file);
+                    
+                    // Store columns for both SOURCE and TARGET tables, but with role information
+                    // This allows us to keep complete data while controlling what's displayed
+                    upsertColumns(asset, columnsObj, assetRole);
+                    logger.info("✅ Added {} columns for {} table: {}", 
+                        assetRole == Asset.Role.TARGET ? "TARGET" : "SOURCE", 
+                        assetRole, shortName);
                 } else {
-                    columns = Map.of(); // Empty map if no columns provided
-                    logger.warn("⚠️ No columns data or invalid format for table: {}", tableName);
+                    logger.info("Skipping intermediate asset persistence for table: {}", shortName);
                 }
-                table.setColumns(columns);
-                
-                tableRepository.save(table);
-                logger.info("✅ SAVED TABLE: {} (role: {}) for file: {}", tableName, table.getTableRole(), file.getFilePath());
             }
         } catch (Exception e) {
             logger.error("Error processing tables for file {}: {}", file.getFilePath(), e.getMessage(), e);
+        }
+    }
+
+    private Asset upsertAsset(UUID runId, String fullName, String shortName, String schemaName, Asset.Role role, ExtractionRun extractionRun) {
+        Asset existing = assetRepository.findFirstByExtractionRunRunIdAndShortName(runId, shortName);
+        if (existing != null) {
+            // Update role/schema if missing
+            if (existing.getSchemaName() == null && schemaName != null) existing.setSchemaName(schemaName);
+            if (existing.getRole() == null && role != null) existing.setRole(role);
+            if (existing.getFullName() == null) existing.setFullName(fullName);
+            
+            // Note: We no longer clear columns when role changes since we now store
+            // SOURCE and TARGET columns separately with role information
+            return assetRepository.save(existing);
+        }
+        Asset a = new Asset();
+        a.setExtractionRun(extractionRun);
+        a.setFullName(fullName);
+        a.setShortName(shortName);
+        a.setSchemaName(schemaName);
+        a.setRole(role);
+        return assetRepository.save(a);
+    }
+
+    private void linkAssetToFile(Asset asset, File file) {
+        try {
+            AssetFile af = new AssetFile();
+            af.setExtractionRun(file.getExtractionRun());
+            af.setFile(file);
+            af.setAsset(asset);
+            assetFileRepository.save(af);
+        } catch (Exception ignore) {
+            // best-effort linking; duplicates are acceptable if db constraints allow
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void upsertColumns(Asset asset, Object columnsObj, Asset.Role role) {
+        if (!(columnsObj instanceof List)) return;
+        try {
+            List<String> cols = (List<String>) columnsObj;
+            if (cols == null) return;
+            
+            // Fetch existing columns for this asset and role to avoid duplicates
+            List<AssetColumn> existing = assetColumnRepository.findByAssetAssetIdAndRole(asset.getAssetId(), role);
+            java.util.Set<String> existingNames = new java.util.HashSet<>();
+            for (AssetColumn c : existing) existingNames.add(c.getColumnName());
+            
+            for (String c : cols) {
+                if (c == null || c.isBlank()) continue;
+                String name = c.trim().toLowerCase();
+                if (existingNames.contains(name)) continue;
+                
+                AssetColumn ac = new AssetColumn();
+                ac.setAsset(asset);
+                ac.setColumnName(name);
+                ac.setRole(role); // Store the role with the column
+                assetColumnRepository.save(ac);
+            }
+        } catch (Exception e) {
+            logger.warn("Failed to upsert columns for asset {} with role {}: {}", asset.getShortName(), role, e.getMessage());
         }
     }
 
@@ -829,52 +880,7 @@ public class ExtractionService {
         return "unknown_schema";
     }
 
-    private String sanitizeSchema(String providedSchema, String tableName) {
-        final String UNKNOWN = "unknown_schema";
-        try {
-            // If a schema is provided, validate it
-            if (providedSchema != null) {
-                String trimmed = providedSchema.trim();
-                if (!trimmed.isEmpty()) {
-                    // Consider any jinja/templating tokens as unknown
-                    if (trimmed.startsWith("{{") || trimmed.endsWith("}}") ||
-                        trimmed.contains("{{") || trimmed.contains("}}") ||
-                        trimmed.contains("%}") || trimmed.contains("{%") ||
-                        trimmed.contains("$") || trimmed.contains("params")) {
-                        return UNKNOWN;
-                    }
-                    return trimmed;
-                }
-            }
-
-            // Fallback: derive schema from table name
-            String derived = deriveSchemaFromTableName(tableName);
-            if (derived == null) {
-                return UNKNOWN;
-            }
-            String t = derived.trim();
-            if (t.isEmpty() || t.startsWith("{{") || t.endsWith("}}") || t.contains("{{") || t.contains("}}")) {
-                return UNKNOWN;
-            }
-            return t;
-        } catch (Exception e) {
-            return UNKNOWN;
-        }
-    }
-
-    private String sanitizeTableName(String rawName) {
-        if (rawName == null) {
-            return null;
-        }
-        String name = rawName.trim();
-        // If name contains jinja-like tokens, attempt to extract the final identifier
-        if (name.contains("{{") || name.contains("}}") || name.contains("%}") || name.contains("{%")) {
-            // Best-effort: drop templating and keep the last token after a dot if present
-            name = name.replaceAll("\\{\\{.*?\\}\\}", "").replaceAll("\\{%.*?%\\}", "");
-            name = name.replaceAll("\\s+", "");
-        }
-        return name;
-    }
+    // Sanitization helpers removed; handled in extractor
 
     /**
      * Process lineage edges from webhook data and save to database
@@ -884,10 +890,8 @@ public class ExtractionService {
             logger.info("Starting to process {} lineage edges for file: {}", lineageEdges.size(), file.getFilePath());
             for (Map<String, Object> edgeData : lineageEdges) {
                 logger.debug("Processing lineage edge data: {}", edgeData);
-                LineageEdge edge = new LineageEdge();
-                edge.setFile(file);
                 
-                // Set required fields
+                // Extract required fields
                 String fromTable = (String) edgeData.get("from_table");
                 String toTable = (String) edgeData.get("to_table");
                 
@@ -897,52 +901,76 @@ public class ExtractionService {
                     continue;
                 }
                 
-                edge.setFromTable(fromTable);
-                edge.setToTable(toTable);
-                
-                // Set optional column fields
+                // Extract optional column fields
                 String fromColumn = (String) edgeData.get("from_column");
                 String toColumn = (String) edgeData.get("to_column");
-                if (fromColumn != null && !fromColumn.trim().isEmpty()) {
-                    edge.setFromColumn(fromColumn);
-                }
-                if (toColumn != null && !toColumn.trim().isEmpty()) {
-                    edge.setToColumn(toColumn);
-                }
                 
-                // Set edge type
+                // Determine edge type
                 String edgeTypeStr = (String) edgeData.get("edge_type");
+                String edgeType = "table_edge";
                 if ("COLUMN_LINEAGE".equalsIgnoreCase(edgeTypeStr) || "COLUMN_EDGE".equalsIgnoreCase(edgeTypeStr)) {
-                    edge.setEdgeType(LineageEdge.EdgeType.COLUMN_EDGE);
-                } else {
-                    edge.setEdgeType(LineageEdge.EdgeType.TABLE_EDGE);
+                    edgeType = "column_edge";
                 }
                 
-                // Set transformation type (required field)
+                // Set transformation type
                 String transformationType = (String) edgeData.get("transformation_type");
                 if (transformationType == null || transformationType.trim().isEmpty()) {
                     transformationType = "UNKNOWN";
                 }
-                edge.setTransformationType(transformationType);
                 
-                // Set transformation details
+                // Extract transformation details
                 @SuppressWarnings("unchecked")
                 Map<String, Object> transformationLines = (Map<String, Object>) edgeData.get("transformation_lines");
+                
+                logger.debug("Processing lineage edge: {} -> {} (type: {}) for file: {}", fromTable, toTable, edgeType, file.getFilePath());
+                // Only persist lineage if both endpoints are stored (i.e., not intermediate)
+                String fromShort = extractShort(fromTable);
+                String toShort = extractShort(toTable);
+                Asset fromAsset = assetRepository.findFirstByExtractionRunRunIdAndShortName(file.getExtractionRun().getRunId(), fromShort);
+                Asset toAsset = assetRepository.findFirstByExtractionRunRunIdAndShortName(file.getExtractionRun().getRunId(), toShort);
+                if (fromAsset == null || toAsset == null) {
+                    logger.info("Skipping lineage edge {} -> {} because one or both endpoints are not persisted (likely intermediate)", fromTable, toTable);
+                    continue;
+                }
+                linkAssetToFile(fromAsset, file);
+                linkAssetToFile(toAsset, file);
+
+                Lineage ln = new Lineage();
+                ln.setExtractionRun(file.getExtractionRun());
+                ln.setFile(file);
+                ln.setFromAsset(fromAsset);
+                ln.setToAsset(toAsset);
+                ln.setFromColumn(fromColumn);
+                ln.setToColumn(toColumn);
+                ln.setEdgeType(edgeType);
+                ln.setTransformationType(transformationType);
                 if (transformationLines != null) {
-                    edge.setTransformationLines(transformationLines);
+                    Object s = transformationLines.get("start_line");
+                    Object e = transformationLines.get("end_line");
+                    ln.setStartLine(parseLineToInt(s));
+                    ln.setEndLine(parseLineToInt(e));
                 }
-                
-                String transformationCode = (String) edgeData.get("transformation_code");
-                if (transformationCode != null && !transformationCode.trim().isEmpty()) {
-                    edge.setTransformationCode(transformationCode);
-                }
-                
-                lineageEdgeRepository.save(edge);
-                logger.debug("Saved lineage edge: {} -> {} for file: {}", fromTable, toTable, file.getFilePath());
+                lineageRepository.save(ln);
             }
         } catch (Exception e) {
             logger.error("Error processing lineage edges for file {}: {}", file.getFilePath(), e.getMessage(), e);
         }
+    }
+
+    private String extractShort(String full) {
+        if (full == null) return null;
+        String[] parts = full.split("\\.");
+        return parts[parts.length - 1];
+    }
+
+    private Integer parseLineToInt(Object value) {
+        if (value instanceof Number) return ((Number) value).intValue();
+        if (value instanceof String) {
+            String s = ((String) value).trim();
+            if (s.toLowerCase().startsWith("l")) s = s.substring(1);
+            try { return Integer.parseInt(s); } catch (NumberFormatException ex) { return null; }
+        }
+        return null;
     }
 
     /**

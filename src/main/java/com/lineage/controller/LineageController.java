@@ -1,16 +1,6 @@
 package com.lineage.controller;
 
 import com.lineage.dto.*;
-import com.lineage.entity.TableEntity;
-import com.lineage.entity.LineageEdge;
-import com.lineage.entity.ProcessedTable;
-import com.lineage.entity.ProcessedColumnLineage;
-import com.lineage.entity.ProcessedTableLineage;
-import com.lineage.repository.TableRepository;
-import com.lineage.repository.LineageEdgeRepository;
-import com.lineage.repository.ProcessedTableRepository;
-import com.lineage.repository.ProcessedColumnLineageRepository;
-import com.lineage.repository.ProcessedTableLineageRepository;
 import com.lineage.service.LineageApiService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -26,7 +16,7 @@ import java.util.UUID;
 /**
  * LineageController exposes REST endpoints for:
  * - Frontend-facing lineage APIs (entity lineage GET/POST, entity details, bulk details)
- * - Admin/debug APIs to browse raw and processed data for a specific extraction run
+ * - Search APIs for asset discovery
  *
  * All routes are served under /api (configured context-path) and /lineage base path here.
  */
@@ -36,22 +26,6 @@ import java.util.UUID;
 public class LineageController {
 
     private static final Logger logger = LoggerFactory.getLogger(LineageController.class);
-
-    @Autowired
-    private TableRepository tableRepository;
-
-    @Autowired
-    private LineageEdgeRepository lineageEdgeRepository;
-
-    @Autowired
-    private ProcessedTableRepository processedTableRepository;
-
-    @Autowired
-    private ProcessedColumnLineageRepository processedColumnLineageRepository;
-
-    @Autowired
-    private ProcessedTableLineageRepository processedTableLineageRepository;
-
 
     @Autowired
     private LineageApiService lineageApiService;
@@ -111,6 +85,21 @@ public class LineageController {
         }
     }
 
+    /**
+     * Frontend endpoint: GET /edge/{edgeId}
+     * Returns details about a specific lineage edge from normalized schema.
+     */
+    @GetMapping("/edge/{edgeId}")
+    public ResponseEntity<EdgeDetailsDto> getEdge(@PathVariable String edgeId) {
+        try {
+            EdgeDetailsDto dto = lineageApiService.getEdgeDetails(edgeId);
+            return ResponseEntity.ok(dto);
+        } catch (Exception e) {
+            logger.error("Failed to get edge details for {}: {}", edgeId, e.getMessage(), e);
+            return ResponseEntity.notFound().build();
+        }
+    }
+
     // ===============================
     // ENTITY ENDPOINTS
     // ===============================
@@ -147,125 +136,5 @@ public class LineageController {
         }
     }
 
-    // ===============================
-    // ADMIN/DEBUG ENDPOINTS (Run-specific)
-    // ===============================
-
-    /**
-     * Admin/debug: Return raw extracted tables for a run (pre-aggregation).
-     */
-    @GetMapping("/runs/{runId}/tables")
-    public ResponseEntity<List<TableEntity>> getTables(@PathVariable UUID runId) {
-        logger.info("Getting raw tables for run: {}", runId);
-        List<TableEntity> tables = tableRepository.findByRunId(runId);
-        return ResponseEntity.ok(tables);
-    }
-
-    /**
-     * Admin/debug: Return raw lineage edges (table/column edges) for a run (pre-aggregation).
-     */
-    @GetMapping("/runs/{runId}/edges")
-    public ResponseEntity<List<LineageEdge>> getLineageEdges(@PathVariable UUID runId) {
-        logger.info("Getting lineage edges for run: {}", runId);
-        List<LineageEdge> edges = lineageEdgeRepository.findByRunId(runId);
-        return ResponseEntity.ok(edges);
-    }
-
-    /**
-     * Admin/debug: Return processed tables for a run (post-aggregation).
-     */
-    @GetMapping("/runs/{runId}/processed-tables")
-    public ResponseEntity<List<ProcessedTable>> getProcessedTables(@PathVariable UUID runId) {
-        logger.info("Getting processed tables for run: {}", runId);
-        List<ProcessedTable> tables = processedTableRepository.findByExtractionRunRunIdOrderByEntityName(runId);
-        return ResponseEntity.ok(tables);
-    }
-
-    /**
-     * Admin/debug: Return processed column-level lineage entries for a run.
-     */
-    @GetMapping("/runs/{runId}/processed-column-lineages")
-    public ResponseEntity<List<ProcessedColumnLineage>> getProcessedColumnLineages(@PathVariable UUID runId) {
-        logger.info("Getting processed column lineages for run: {}", runId);
-        List<ProcessedColumnLineage> lineages = processedColumnLineageRepository.findByRunIdOrderByDownstreamTable(runId);
-        return ResponseEntity.ok(lineages);
-    }
-
-    /**
-     * Admin/debug: Return processed table-level lineage relationships for a run.
-     */
-    @GetMapping("/runs/{runId}/processed-table-lineages")
-    public ResponseEntity<List<ProcessedTableLineage>> getProcessedTableLineages(@PathVariable UUID runId) {
-        logger.info("Getting processed table lineages for run: {}", runId);
-        List<ProcessedTableLineage> lineages = processedTableLineageRepository.findByExtractionRunRunIdOrderByTableName(runId);
-        return ResponseEntity.ok(lineages);
-    }
-
-    /**
-     * Admin/debug: Convenience endpoint returning only tables that have upstream dependencies.
-     */
-    @GetMapping("/runs/{runId}/table-relationships")
-    public ResponseEntity<List<ProcessedTableLineage>> getTableRelationships(@PathVariable UUID runId) {
-        logger.info("Getting table relationships for run: {}", runId);
-        List<ProcessedTableLineage> relationships = processedTableLineageRepository.findTablesWithUpstreamDependencies(runId);
-        return ResponseEntity.ok(relationships);
-    }
-
-    /**
-     * Admin/debug: Return a map keyed by entity_id with processed table details (legacy shape).
-     */
-    @GetMapping("/runs/{runId}/table-details")
-    public ResponseEntity<Map<String, Object>> getTableDetails(@PathVariable UUID runId) {
-        logger.info("Getting table details for run: {}", runId);
-
-        List<ProcessedTable> tables = processedTableRepository.findByExtractionRunRunIdOrderByEntityName(runId);
-        Map<String, Object> tableDetails = new HashMap<>();
-        
-        for (ProcessedTable table : tables) {
-            Map<String, Object> tableInfo = new HashMap<>();
-            tableInfo.put("entity_id", table.getEntityId());
-            tableInfo.put("entity_name", table.getEntityName());
-            tableInfo.put("source", table.getSource());
-            tableInfo.put("entity_type", table.getEntityType());
-            tableInfo.put("columns", table.getColumnsCount());
-            tableInfo.put("tool_key", table.getToolKey());
-            tableInfo.put("partition_keys", table.getPartitionKeys());
-            tableInfo.put("schemaMetadata", table.getSchemaMetadata());
-            
-            // Get fine-grained lineages for this table
-            List<ProcessedColumnLineage> columnLineages = processedColumnLineageRepository
-                .findByRunIdAndDownstreamTable(runId, table.getEntityId());
-            tableInfo.put("fineGrainedLineages", columnLineages);
-            
-            tableDetails.put(table.getEntityId(), tableInfo);
-        }
-
-        return ResponseEntity.ok(tableDetails);
-    }
-
-    /**
-     * Admin/debug: Return aggregated counters for raw and processed entities for a run.
-     */
-    @GetMapping("/runs/{runId}/stats")
-    public ResponseEntity<Map<String, Object>> getLineageStats(@PathVariable UUID runId) {
-        logger.info("Getting lineage statistics for run: {}", runId);
-
-        Map<String, Object> stats = new HashMap<>();
-        
-        long rawTableCount = tableRepository.countByRunId(runId);
-        long rawEdgeCount = lineageEdgeRepository.countByRunId(runId);
-        long processedTableCount = processedTableRepository.countByRunId(runId);
-        long processedColumnLineageCount = processedColumnLineageRepository.countByRunId(runId);
-        long processedTableLineageCount = processedTableLineageRepository.countByRunId(runId);
-        
-        stats.put("rawTables", rawTableCount);
-        stats.put("rawEdges", rawEdgeCount);
-        stats.put("processedTables", processedTableCount);
-        stats.put("processedColumnLineages", processedColumnLineageCount);
-        stats.put("processedTableLineages", processedTableLineageCount);
-
-        return ResponseEntity.ok(stats);
-    }
-
-    // Removed manual batch reprocess endpoint — real-time processing keeps data in sync.
+    // Legacy admin endpoints removed - using simplified normalized schema
 }
