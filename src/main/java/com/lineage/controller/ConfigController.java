@@ -43,7 +43,6 @@ public class ConfigController {
         c.setRepositoryUrl(req.getRepositoryUrl());
         c.setBranch(req.getBranch());
         c.setGithubToken(req.getGithubToken());
-        c.setGroqKey(req.getGroqKey());
         c = configRepository.save(c);
         return ResponseEntity.ok(toDto(c));
     }
@@ -57,7 +56,6 @@ public class ConfigController {
         if (req.getRepositoryUrl() != null) c.setRepositoryUrl(req.getRepositoryUrl());
         if (req.getBranch() != null) c.setBranch(req.getBranch());
         if (req.getGithubToken() != null) c.setGithubToken(req.getGithubToken());
-        if (req.getGroqKey() != null) c.setGroqKey(req.getGroqKey());
         c = configRepository.save(c);
         return ResponseEntity.ok(toDto(c));
     }
@@ -81,7 +79,6 @@ public class ConfigController {
         dto.setRepositoryUrl(c.getRepositoryUrl());
         dto.setBranch(c.getBranch());
         dto.setGithubTokenMasked(mask(c.getGithubToken()));
-        dto.setGroqKeyMasked(mask(c.getGroqKey()));
         dto.setCreatedAt(c.getCreatedAt());
         dto.setUpdatedAt(c.getUpdatedAt());
         return dto;

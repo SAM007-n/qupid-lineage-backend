@@ -3,7 +3,7 @@ spring:
     name: sql-dependency-extractor-backend
   
   datasource:
-    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/lineage_extractor}
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/lineage_db}
     username: ${SPRING_DATASOURCE_USERNAME:postgres}
     password: ${SPRING_DATASOURCE_PASSWORD:lineage123}
     driver-class-name: org.postgresql.Driver

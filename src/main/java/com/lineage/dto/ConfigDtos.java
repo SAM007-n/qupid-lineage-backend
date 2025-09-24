@@ -11,7 +11,6 @@ public class ConfigDtos {
         private String repositoryUrl;
         private String branch;
         private String githubTokenMasked;
-        private String groqKeyMasked;
         private LocalDateTime createdAt;
         private LocalDateTime updatedAt;
         public UUID getId() { return id; }
@@ -24,8 +23,6 @@ public class ConfigDtos {
         public void setBranch(String branch) { this.branch = branch; }
         public String getGithubTokenMasked() { return githubTokenMasked; }
         public void setGithubTokenMasked(String githubTokenMasked) { this.githubTokenMasked = githubTokenMasked; }
-        public String getGroqKeyMasked() { return groqKeyMasked; }
-        public void setGroqKeyMasked(String groqKeyMasked) { this.groqKeyMasked = groqKeyMasked; }
         public LocalDateTime getCreatedAt() { return createdAt; }
         public void setCreatedAt(LocalDateTime createdAt) { this.createdAt = createdAt; }
         public LocalDateTime getUpdatedAt() { return updatedAt; }
@@ -37,7 +34,6 @@ public class ConfigDtos {
         private String repositoryUrl;
         private String branch;
         private String githubToken;
-        private String groqKey;
         public String getProfile() { return profile; }
         public void setProfile(String profile) { this.profile = profile; }
         public String getRepositoryUrl() { return repositoryUrl; }
@@ -46,8 +42,6 @@ public class ConfigDtos {
         public void setBranch(String branch) { this.branch = branch; }
         public String getGithubToken() { return githubToken; }
         public void setGithubToken(String githubToken) { this.githubToken = githubToken; }
-        public String getGroqKey() { return groqKey; }
-        public void setGroqKey(String groqKey) { this.groqKey = groqKey; }
     }
 
     public static class ConfigUpdateRequest {
@@ -55,7 +49,6 @@ public class ConfigDtos {
         private String repositoryUrl;
         private String branch;
         private String githubToken;
-        private String groqKey;
         public String getProfile() { return profile; }
         public void setProfile(String profile) { this.profile = profile; }
         public String getRepositoryUrl() { return repositoryUrl; }
@@ -64,8 +57,6 @@ public class ConfigDtos {
         public void setBranch(String branch) { this.branch = branch; }
         public String getGithubToken() { return githubToken; }
         public void setGithubToken(String githubToken) { this.githubToken = githubToken; }
-        public String getGroqKey() { return groqKey; }
-        public void setGroqKey(String groqKey) { this.groqKey = groqKey; }
     }
 }
 

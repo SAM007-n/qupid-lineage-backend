@@ -31,9 +31,6 @@ public class Config {
     @Column(name = "github_token", length = 4096)
     private String githubToken;
 
-    @Column(name = "groq_key", length = 4096)
-    private String groqKey;
-
     @CreationTimestamp
     @Column(name = "created_at", updatable = false)
     private LocalDateTime createdAt;
@@ -52,8 +49,6 @@ public class Config {
     public void setBranch(String branch) { this.branch = branch; }
     public String getGithubToken() { return githubToken; }
     public void setGithubToken(String githubToken) { this.githubToken = githubToken; }
-    public String getGroqKey() { return groqKey; }
-    public void setGroqKey(String groqKey) { this.groqKey = groqKey; }
     public LocalDateTime getCreatedAt() { return createdAt; }
     public void setCreatedAt(LocalDateTime createdAt) { this.createdAt = createdAt; }
     public LocalDateTime getUpdatedAt() { return updatedAt; }

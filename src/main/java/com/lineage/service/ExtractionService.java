@@ -61,6 +61,9 @@ public class ExtractionService {
     // Removed legacy processing service
     @Autowired
     private ExtractionLogRepository logRepository;
+    
+    @Autowired
+    private GroqService groqService;
 
     // Track running processes for control operations
     private final java.util.concurrent.ConcurrentHashMap<UUID, Process> runningProcesses = new java.util.concurrent.ConcurrentHashMap<>();
@@ -98,10 +101,10 @@ public class ExtractionService {
         jobStatusRepository.save(jobStatus);
 
         // Launch Docker container for extraction
-        final String groqApiKey = System.getenv("GROQ_API_KEY");
+        final String groqApiKey = groqService.getGroqApiKey();
         if (groqApiKey == null || groqApiKey.isEmpty()) {
-            logger.error("GROQ_API_KEY environment variable is not set");
-            throw new RuntimeException("GROQ_API_KEY environment variable is required");
+            logger.error("Groq API key is not configured in the database");
+            throw new RuntimeException("Groq API key is not configured. Please set the API key using the settings endpoint first.");
         }
 
         final UUID runId = extractionRun.getRunId();
